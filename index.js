@@ -369,13 +369,13 @@ exports.sendMessage = function(data) {
     var bounceData = "";
     switch (data.smtpErr) {
       case '552':
-        bounceData = "Odeslání emailu se nezdařilo. Prosím ujistěte se, že velikost vašeho emailu je maximálně 10 MB.\n\n" + "SMTP Reply Code = 552, SMTP Status Code = 5.3.4";
+        bounceData = "Failed to send an email. Please ensure the size of your email is less than 10 MB.\n\n" + "SMTP Reply Code = 552, SMTP Status Code = 5.3.4";
         break;
       case '550':
-        bounceData = "Odeslání emailu se nezdařilo. Emailová adresa příjemce nebyla nalezena. Zkontrolujte prosím zadanou adresu. \n\n" + "SMTP Reply Code = 550, SMTP Status Code = 5.1.1";
+        bounceData = "Failed to send an email. The recipient's email address was not found. Please check the address entered. \n\n" + "SMTP Reply Code = 550, SMTP Status Code = 5.1.1";
         break;
       default:
-        bounceData = "Neznámá chyba, zkuste to prosím později."
+        bounceData = "Unknown error, please try again later."
     }
 
     params = {
@@ -385,11 +385,11 @@ exports.sendMessage = function(data) {
       Source: data.config.notifyEmail,
       Message: {
         Subject: {
-          Data: "Zpráva o nedoručení emailu (Chyba)"
+          Data: "Email undeliverable message (Error)"
         },
         Body: {
           Text: {
-            Data: "Během zpracování emailu pro následující příjemce: " + data.originalRecipients + ", nastala chyba. \n\n" + bounceData
+            Data: "An error happened during email processing for the following recipients: " + data.originalRecipients + ". \n\n" + bounceData
           }
         }
       }
