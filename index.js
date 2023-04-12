@@ -4,12 +4,20 @@ var AWS = require('aws-sdk');
 
 console.log("AWS Lambda SES Forwarder // @arithmetric // Version 5.0.0");
 
+/*global TextDecoder */
+
 // Configure the S3 bucket and key prefix for stored raw emails, and the
 // mapping of email addresses to forward from and to.
 //
 // Expected keys/values:
 //
 // - fromEmail: Forwarded emails will come from this verified address
+// - notifyEmail: This will be used to notify the sender, if the mail could not
+//   be delivered.
+//
+// - notify550: Enables auto response when email address was not found.
+//
+// - notify552: Enables auto response if mail is larger than 10 MB.
 //
 // - subjectPrefix: Forwarded emails subject will contain this prefix
 //
@@ -102,7 +110,7 @@ exports.transformRecipients = function(data) {
     }
     if (data.config.forwardMapping.hasOwnProperty(origEmailKey)) {
       newRecipients = newRecipients.concat(
-        data.config.forwardMapping[origEmailKey]);
+          data.config.forwardMapping[origEmailKey]);
       data.originalRecipient = origEmail;
     } else {
       var origEmailDomain;
@@ -117,16 +125,16 @@ exports.transformRecipients = function(data) {
       if (origEmailDomain &&
           data.config.forwardMapping.hasOwnProperty(origEmailDomain)) {
         newRecipients = newRecipients.concat(
-          data.config.forwardMapping[origEmailDomain]);
+            data.config.forwardMapping[origEmailDomain]);
         data.originalRecipient = origEmail;
       } else if (origEmailUser &&
-        data.config.forwardMapping.hasOwnProperty(origEmailUser)) {
+          data.config.forwardMapping.hasOwnProperty(origEmailUser)) {
         newRecipients = newRecipients.concat(
-          data.config.forwardMapping[origEmailUser]);
+            data.config.forwardMapping[origEmailUser]);
         data.originalRecipient = origEmail;
       } else if (data.config.forwardMapping.hasOwnProperty("@")) {
         newRecipients = newRecipients.concat(
-          data.config.forwardMapping["@"]);
+            data.config.forwardMapping["@"]);
         data.originalRecipient = origEmail;
       }
     }
@@ -135,10 +143,15 @@ exports.transformRecipients = function(data) {
   if (!newRecipients.length) {
     data.log({
       message: "Finishing process. No new recipients found for " +
-        "original destinations: " + data.originalRecipients.join(", "),
+          "original destinations: " + data.originalRecipients.join(", "),
       level: "info"
     });
-    return data.callback();
+
+    if (data.config.notify550) {
+      data.smtpErr = "550";
+    } else {
+      return data.callback();
+    }
   }
 
   data.recipients = newRecipients;
@@ -157,13 +170,13 @@ exports.fetchMessage = function(data) {
   data.log({
     level: "info",
     message: "Fetching email at s3://" + data.config.emailBucket + '/' +
-      data.config.emailKeyPrefix + data.email.messageId
+        data.config.emailKeyPrefix + data.email.messageId
   });
   return new Promise(function(resolve, reject) {
     data.s3.copyObject({
       Bucket: data.config.emailBucket,
       CopySource: data.config.emailBucket + '/' + data.config.emailKeyPrefix +
-        data.email.messageId,
+          data.email.messageId,
       Key: data.config.emailKeyPrefix + data.email.messageId,
       ACL: 'private',
       ContentType: 'text/plain',
@@ -177,13 +190,15 @@ exports.fetchMessage = function(data) {
           stack: err.stack
         });
         return reject(
-          new Error("Error: Could not make readable copy of email."));
+            new Error("Error: Could not make readable copy of email."));
       }
 
       // Load the raw email from S3
       data.s3.getObject({
         Bucket: data.config.emailBucket,
         Key: data.config.emailKeyPrefix + data.email.messageId
+        // ContentType: 'text/plain',
+        // ContentEncoding: 'Windows-1250'
       }, function(err, result) {
         if (err) {
           data.log({
@@ -193,9 +208,48 @@ exports.fetchMessage = function(data) {
             stack: err.stack
           });
           return reject(
-            new Error("Error: Failed to load message body from S3."));
+              new Error("Error: Failed to load message body from S3."));
         }
-        data.emailData = result.Body.toString();
+
+        // Check content lenght (SES hardcoded 10 MB - 10_000_000 bytes)
+        if (result.ContentLength >= 10000000) {
+          if (data.config.notify552) {
+            data.smtpErr = "552",
+                data.log({
+                  level: "info",
+                  message: "ContentLength > 10 MB, size = " + result.ContentLength + " bytes (SMTP 552)"
+                });
+          } else {
+            data.log({
+              level: "error",
+              message: "ContentLength > 10 MB, size = " + result.ContentLength + " bytes (SMTP 552)"
+            });
+            return reject(
+                new Error("Error: Mail size exceeds 10 MB."));
+          }
+        }
+
+        const naivelyReadBody = result.Body.toString();
+        const encodingMatches = naivelyReadBody.match(/text\/plain;\s*charset=([^;]+);/);
+        if (encodingMatches) {
+          try {
+            const encoding = encodingMatches[1]
+            const textDecoder = new TextDecoder(encoding);
+
+            data.emailData = textDecoder.decode(result.Body)
+          } catch (err) {
+            data.log({
+              level: "error",
+              message: "Could not decode body with desired encoding, fallback for naively read body.",
+              error: err,
+              stack: err.stack
+            });
+            data.emailData = naivelyReadBody;
+          }
+        } else {
+          data.emailData = naivelyReadBody;
+        }
+
         return resolve(data);
       });
     });
@@ -221,6 +275,7 @@ exports.processMessage = function(data) {
     var from = match && match[1] ? match[1] : '';
     if (from) {
       header = header + 'Reply-To: ' + from;
+      data.from = from;
       data.log({
         level: "info",
         message: "Added Reply-To address of: " + from
@@ -229,35 +284,37 @@ exports.processMessage = function(data) {
       data.log({
         level: "info",
         message: "Reply-To address not added because From address was not " +
-          "properly extracted."
+            "properly extracted."
       });
     }
   }
+
 
   // SES does not allow sending messages from an unverified address,
   // so replace the message's "From:" header with the original
   // recipient (which is a verified domain)
   header = header.replace(
-    /^from:[\t ]?(.*(?:\r?\n\s+.*)*)/mgi,
-    function(match, from) {
-      var fromText;
-      if (data.config.fromEmail) {
-        fromText = 'From: ' + from.replace(/<(.*)>/, '').trim() +
-        ' <' + data.config.fromEmail + '>';
-      } else {
-        fromText = 'From: ' + from.replace('<', 'at ').replace('>', '') +
-        ' <' + data.originalRecipient + '>';
-      }
-      return fromText;
-    });
+      /^from:[\t ]?(.*(?:\r?\n\s+.*)*)/mgi,
+      function(match, from) {
+        var fromText;
+        if (data.config.fromEmail) {
+          fromText = 'From: ' + from.replace(/<(.*)>/, '').trim() +
+              ' <' + data.config.fromEmail + '>';
+        } else {
+          fromText = 'From: ' + from.replace('<', 'at ').replace('>', '') +
+              ' <' + data.originalRecipient + '>';
+        }
+        return fromText;
+      });
 
   // Add a prefix to the Subject
   if (data.config.subjectPrefix) {
     header = header.replace(
-      /^subject:[\t ]?(.*)/mgi,
-      function(match, subject) {
-        return 'Subject: ' + data.config.subjectPrefix + subject;
-      });
+        /^subject:[\t ]?(.*)/mgi,
+        function(match, subject) {
+          data.subject = subject;
+          return 'Subject: ' + data.config.subjectPrefix + subject;
+        });
   }
 
   // Replace original 'To' header with a manually defined one
@@ -273,6 +330,13 @@ exports.processMessage = function(data) {
 
   // Remove Message-ID header.
   header = header.replace(/^message-id:[\t ]?(.*)\r?\n/mgi, '');
+
+  const charsetRegex = /content-type:\s*text\/([^;]+);\s*charset=([^;\s]+)/gi
+  const replacementText = 'Content-Type: text/$1; charset=UTF-8'
+
+  // JS only supports UTF-8 kinda, we also converted the text of the email into UTF8 in fetchMessage function
+  header = header.replace(charsetRegex, replacementText)
+  body = body.replace(charsetRegex, replacementText)
 
   // Remove all DKIM-Signature headers to prevent triggering an
   // "InvalidParameterValue: Duplicate header 'DKIM-Signature'" error.
@@ -299,30 +363,94 @@ exports.sendMessage = function(data) {
       Data: data.emailData
     }
   };
-  data.log({
-    level: "info",
-    message: "sendMessage: Sending email via SES. Original recipients: " +
-      data.originalRecipients.join(", ") + ". Transformed recipients: " +
-      data.recipients.join(", ") + "."
-  });
-  return new Promise(function(resolve, reject) {
-    data.ses.sendRawEmail(params, function(err, result) {
-      if (err) {
-        data.log({
-          level: "error",
-          message: "sendRawEmail() returned error.",
-          error: err,
-          stack: err.stack
-        });
-        return reject(new Error('Error: Email sending failed.'));
+
+  // Format params if we are bouncing
+  if (data.smtpErr != "" && data.config.notifyEmail != "") {
+    var bounceData = "";
+    switch (data.smtpErr) {
+      case '552':
+        bounceData = "Odeslání emailu se nezdařilo. Prosím ujistěte se, že velikost vašeho emailu je maximálně 10 MB.\n\n" + "SMTP Reply Code = 552, SMTP Status Code = 5.3.4";
+        break;
+      case '550':
+        bounceData = "Odeslání emailu se nezdařilo. Emailová adresa příjemce nebyla nalezena. Zkontrolujte prosím zadanou adresu. \n\n" + "SMTP Reply Code = 550, SMTP Status Code = 5.1.1";
+        break;
+      default:
+        bounceData = "Neznámá chyba, zkuste to prosím později."
+    }
+
+    params = {
+      Destination: {
+        ToAddresses: [data.from]
+      },
+      Source: data.config.notifyEmail,
+      Message: {
+        Subject: {
+          Data: "Zpráva o nedoručení emailu (Chyba)"
+        },
+        Body: {
+          Text: {
+            Data: "Během zpracování emailu pro následující příjemce: " + data.originalRecipients + ", nastala chyba. \n\n" + bounceData
+          }
+        }
       }
-      data.log({
-        level: "info",
-        message: "sendRawEmail() successful.",
-        result: result
-      });
-      resolve(data);
+    };
+
+    data.log({
+      level: "info",
+      message: "sendMessage: Sending bounce email via SES. Recipients: " +
+          data.originalRecipients + ". Bounce code: " + data.smtpErr + " Sended to: " + data.from
     });
+  } else {
+    data.log({
+      level: "info",
+      message: "sendMessage: Sending email via SES. Original recipients: " +
+          data.originalRecipients.join(", ") + ". Transformed recipients: " +
+          data.recipients.join(", ") + "."
+    });
+  }
+
+
+  return new Promise(function(resolve, reject) {
+    if (data.smtpErr != "" && data.config.notifyEmail != "") {
+      // If bounce
+      data.ses.sendEmail(params, function(err, result) {
+        if (err) {
+          data.log({
+            level: "error",
+            message: "sendRawEmail() data.smtpErr returned error.",
+            error: err,
+            stack: err.stack
+          });
+          return reject(new Error('Error: Email sending failed.'));
+        }
+        data.log({
+          level: "info",
+          message: "sendRawEmail() data.smtpErr successful.",
+          result: result
+        });
+        resolve(data);
+      });
+
+    } else {
+      // If OK
+      data.ses.sendRawEmail(params, function(err, result) {
+        if (err) {
+          data.log({
+            level: "error",
+            message: "sendRawEmail() returned error.",
+            error: err,
+            stack: err.stack
+          });
+          return reject(new Error('Error: Email sending failed.'));
+        }
+        data.log({
+          level: "info",
+          message: "sendRawEmail() successful.",
+          result: result
+        });
+        resolve(data);
+      });
+    }
   });
 };
 
@@ -338,40 +466,43 @@ exports.sendMessage = function(data) {
  */
 exports.handler = function(event, context, callback, overrides) {
   var steps = overrides && overrides.steps ? overrides.steps :
-    [
-      exports.parseEvent,
-      exports.transformRecipients,
-      exports.fetchMessage,
-      exports.processMessage,
-      exports.sendMessage
-    ];
+      [
+        exports.parseEvent,
+        exports.transformRecipients,
+        exports.fetchMessage,
+        exports.processMessage,
+        exports.sendMessage
+      ];
   var data = {
     event: event,
     callback: callback,
     context: context,
+    from: "",
+    subject: "",
+    smtpErr: "",
     config: overrides && overrides.config ? overrides.config : defaultConfig,
     log: overrides && overrides.log ? overrides.log : console.log,
     ses: overrides && overrides.ses ? overrides.ses : new AWS.SES(),
     s3: overrides && overrides.s3 ?
-      overrides.s3 : new AWS.S3({signatureVersion: 'v4'})
+        overrides.s3 : new AWS.S3({signatureVersion: 'v4'})
   };
   Promise.series(steps, data)
-    .then(function(data) {
-      data.log({
-        level: "info",
-        message: "Process finished successfully."
+      .then(function(data) {
+        data.log({
+          level: "info",
+          message: "Process finished successfully."
+        });
+        return data.callback();
+      })
+      .catch(function(err) {
+        data.log({
+          level: "error",
+          message: "Step returned error: " + err.message,
+          error: err,
+          stack: err.stack
+        });
+        return data.callback(new Error("Error: Step returned error."));
       });
-      return data.callback();
-    })
-    .catch(function(err) {
-      data.log({
-        level: "error",
-        message: "Step returned error: " + err.message,
-        error: err,
-        stack: err.stack
-      });
-      return data.callback(new Error("Error: Step returned error."));
-    });
 };
 
 Promise.series = function(promises, initValue) {
